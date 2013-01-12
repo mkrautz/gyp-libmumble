@@ -129,8 +129,9 @@ class AndroidMkWriter(object):
   Its only real entry point is Write(), and is mostly used for namespacing.
   """
 
-  def __init__(self, android_top_dir):
+  def __init__(self, android_top_dir, android_ndk_version):
     self.android_top_dir = android_top_dir
+    self.android_ndk_version = android_ndk_version
 
   def Write(self, qualified_target, base_path, output_filename, spec, configs,
             part_of_all):
@@ -587,7 +588,7 @@ class AndroidMkWriter(object):
     distinguish gyp-generated module names.
     """
 
-    if int(spec.get('android_unmangled_name', 0)):
+    if self.android_ndk_version or int(spec.get('android_unmangled_name', 0)):
       assert self.type != 'shared_library' or self.target.startswith('lib')
       return self.target
 
@@ -686,7 +687,11 @@ class AndroidMkWriter(object):
 
   def NormalizeLdFlags(self, ld_flags):
     """ Clean up ldflags from gyp file.
-    Remove any ldflags that contain android_top_dir.
+    When generating for the Android build system, remove
+    any ldflags that contain android_top_dir.
+
+    When generating for the NDK build system, this method
+    is a no-op.
 
     Args:
       ld_flags: ldflags from gyp files.
@@ -694,6 +699,8 @@ class AndroidMkWriter(object):
     Returns:
       clean ldflags
     """
+    if self.android_ndk_version:
+      return ld_flags
     clean_ldflags = []
     for flag in ld_flags:
       if self.android_top_dir in flag:
@@ -712,6 +719,8 @@ class AndroidMkWriter(object):
     Returns:
       A list of normalized include paths.
     """
+    if self.android_ndk_version:
+      return include_paths
     normalized = []
     for path in include_paths:
       if path[0] == '/':
@@ -812,20 +821,32 @@ class AndroidMkWriter(object):
 
     # Libraries (i.e. -lfoo)
     libraries = gyp.common.uniquer(spec.get('libraries', []))
-    static_libs, dynamic_libs = self.ComputeAndroidLibraryModuleNames(
-        libraries)
+    if self.android_ndk_version:
+      # Link dependencies (i.e. libfoo.a, libfoo.so)
+      static_link_deps = [x[1] for x in link_deps if x[0] == 'static']
+      shared_link_deps = [x[1] for x in link_deps if x[0] == 'shared']
+      self.WriteLn('')
+      self.WriteList(static_flags + static_link_deps,
+                     'LOCAL_STATIC_LIBRARIES')
+      self.WriteLn('# Enable grouping to fix circular references')
+      self.WriteLn('LOCAL_GROUP_STATIC_LIBRARIES := true')
+      self.WriteLn('')
+      self.WriteList(dynamic_flags + libraries + shared_link_deps,
+                     'LOCAL_LDLIBS')
+    else:
+      static_libs, dynamic_libs = self.ComputeAndroidLibraryModuleNames(libraries)
 
-    # Link dependencies (i.e. libfoo.a, libfoo.so)
-    static_link_deps = [x[1] for x in link_deps if x[0] == 'static']
-    shared_link_deps = [x[1] for x in link_deps if x[0] == 'shared']
-    self.WriteLn('')
-    self.WriteList(static_flags + static_libs + static_link_deps,
-                   'LOCAL_STATIC_LIBRARIES')
-    self.WriteLn('# Enable grouping to fix circular references')
-    self.WriteLn('LOCAL_GROUP_STATIC_LIBRARIES := true')
-    self.WriteLn('')
-    self.WriteList(dynamic_flags + dynamic_libs + shared_link_deps,
-                   'LOCAL_SHARED_LIBRARIES')
+      # Link dependencies (i.e. libfoo.a, libfoo.so)
+      static_link_deps = [x[1] for x in link_deps if x[0] == 'static']
+      shared_link_deps = [x[1] for x in link_deps if x[0] == 'shared']
+      self.WriteLn('')
+      self.WriteList(static_flags + static_libs + static_link_deps,
+                     'LOCAL_STATIC_LIBRARIES')
+      self.WriteLn('# Enable grouping to fix circular references')
+      self.WriteLn('LOCAL_GROUP_STATIC_LIBRARIES := true')
+      self.WriteLn('')
+      self.WriteList(dynamic_flags + dynamic_libs + shared_link_deps,
+                     'LOCAL_SHARED_LIBRARIES')
 
 
   def WriteTarget(self, spec, configs, deps, link_deps, part_of_all):
@@ -921,13 +942,14 @@ class AndroidMkWriter(object):
       # normpath is still important for trimming trailing slashes.
       return os.path.normpath(path)
     local_path = os.path.join('$(LOCAL_PATH)', self.path, path)
-    local_path = os.path.normpath(local_path)
-    # Check that normalizing the path didn't ../ itself out of $(LOCAL_PATH)
-    # - i.e. that the resulting path is still inside the project tree. The
-    # path may legitimately have ended up containing just $(LOCAL_PATH), though,
-    # so we don't look for a slash.
-    assert local_path.startswith('$(LOCAL_PATH)'), (
-           'Path %s attempts to escape from gyp path %s !)' % (path, self.path))
+    if not self.android_ndk_version:
+      local_path = os.path.normpath(local_path)
+      # Check that normalizing the path didn't ../ itself out of $(LOCAL_PATH)
+      # - i.e. that the resulting path is still inside the project tree. The
+      # path may legitimately have ended up containing just $(LOCAL_PATH), though,
+      # so we don't look for a slash.
+      assert local_path.startswith('$(LOCAL_PATH)'), (
+             'Path %s attempts to escape from gyp path %s !)' % (path, self.path))
     return local_path
 
 
@@ -958,8 +980,10 @@ def GenerateOutput(target_list, target_dicts, data, params):
   generator_flags = params.get('generator_flags', {})
   builddir_name = generator_flags.get('output_dir', 'out')
   limit_to_target_all = generator_flags.get('limit_to_target_all', False)
+  android_ndk_version = generator_flags.get('android_ndk_version', None)
   android_top_dir = os.environ.get('ANDROID_BUILD_TOP')
-  assert android_top_dir, '$ANDROID_BUILD_TOP not set; you need to run lunch.'
+  if not android_ndk_version:
+    assert android_top_dir, '$ANDROID_BUILD_TOP not set; you need to run lunch.'
 
   def CalculateMakefilePath(build_file, base_name):
     """Determine where to write a Makefile for a given gyp file."""
@@ -967,14 +991,26 @@ def GenerateOutput(target_list, target_dicts, data, params):
     # paths relative to the source root for the master makefile.  Grab
     # the path of the .gyp file as the base to relativize against.
     # E.g. "foo/bar" when we're constructing targets for "foo/bar/baz.gyp".
-    base_path = gyp.common.RelativePath(os.path.dirname(build_file),
-                                        options.depth)
-    # We write the file in the base_path directory.
-    output_file = os.path.join(options.depth, base_path, base_name)
-    assert not options.generator_output, (
-        'The Android backend does not support options.generator_output.')
-    base_path = gyp.common.RelativePath(os.path.dirname(build_file),
-                                        options.toplevel_dir)
+    base_path = None
+    output_file = None
+    if android_ndk_version:
+      relative_to = options.depth
+      if options.generator_output:
+        relative_to = options.generator_output
+      base_path = gyp.common.RelativePath(os.path.dirname(build_file),
+                                          options.depth)
+      output_file = os.path.join(relative_to, base_path, base_name)
+      rel = gyp.common.RelativePath(options.depth, relative_to)
+      base_path = os.path.join(rel, base_path)
+    else:
+      base_path = gyp.common.RelativePath(os.path.dirname(build_file),
+                                          options.depth)
+      # We write the file in the base_path directory.
+      output_file = os.path.join(options.depth, base_path, base_name)
+      assert not options.generator_output, (
+            'The Android backend does not support options.generator_output for non-NDK builds.')
+      base_path = gyp.common.RelativePath(os.path.dirname(build_file),
+                                          options.toplevel_dir)
     return base_path, output_file
 
   # TODO:  search for the first non-'Default' target.  This can go
@@ -991,10 +1027,18 @@ def GenerateOutput(target_list, target_dicts, data, params):
     default_configuration = 'Default'
 
   srcdir = '.'
-  makefile_name = 'GypAndroid' + options.suffix + '.mk'
-  makefile_path = os.path.join(options.toplevel_dir, makefile_name)
-  assert not options.generator_output, (
-      'The Android backend does not support options.generator_output.')
+  prefix = 'Gyp'
+  if generator_flags.get('android_ndk_version', None):
+    prefix = ''
+  makefile_name = prefix + 'Android' + options.suffix + '.mk'
+  makefile_path = None
+  if not android_ndk_version:
+    makefile_path = os.path.join(options.toplevel_dir, makefile_name)
+    assert not options.generator_output, (
+        'The Android backend does not support options.generator_output.')
+  else:
+    makefile_path = os.path.join(options.generator_output, makefile_name)
+
   make.ensure_directory_exists(makefile_path)
   root_makefile = open(makefile_path, 'w')
 
@@ -1045,7 +1089,7 @@ def GenerateOutput(target_list, target_dicts, data, params):
                    not int(spec.get('suppress_wildcard', False)))
     if limit_to_target_all and not part_of_all:
       continue
-    writer = AndroidMkWriter(android_top_dir)
+    writer = AndroidMkWriter(android_top_dir, android_ndk_version)
     android_module = writer.Write(qualified_target, base_path, output_file,
                                   spec, configs, part_of_all=part_of_all)
     if android_module in android_modules:
@@ -1063,7 +1107,9 @@ def GenerateOutput(target_list, target_dicts, data, params):
     include_list.add(mkfile_rel_path)
 
   # Some tools need to know the absolute path of the top directory.
-  root_makefile.write('GYP_ABS_ANDROID_TOP_DIR := $(shell pwd)\n')
+  if not android_ndk_version:
+    root_makefile.write('GYP_ABS_ANDROID_TOP_DIR := $(shell pwd)\n')
+
   root_makefile.write('GYP_DEFAULT_CONFIGURATION := %s\n' %
                       default_configuration)
 
