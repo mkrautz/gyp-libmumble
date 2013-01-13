@@ -904,8 +904,9 @@ class AndroidMkWriter(object):
       self.WriteLn('LOCAL_MODULE_PATH := $(PRODUCT_OUT)/gyp_stamp')
       self.WriteLn('LOCAL_UNINSTALLABLE_MODULE := true')
       self.WriteLn()
-      self.WriteLn('include $(BUILD_SYSTEM)/base_rules.mk')
-      self.WriteLn()
+      if not self.android_ndk_version:
+        self.WriteLn('include $(BUILD_SYSTEM)/base_rules.mk')
+        self.WriteLn()
       self.WriteLn('$(LOCAL_BUILT_MODULE): $(LOCAL_ADDITIONAL_DEPENDENCIES)')
       self.WriteLn('\t$(hide) echo "Gyp timestamp: $@"')
       self.WriteLn('\t$(hide) mkdir -p $(dir $@)')
